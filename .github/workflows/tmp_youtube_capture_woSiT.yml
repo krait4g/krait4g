@@ -1,0 +1,242 @@
+name: tmp-youtube-source-capture-woSiT
+
+on:
+  push:
+    branches:
+      - 'tmp/youtube-analysis-woSiT-kytXo'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VIDEO_ID: woSiT_kytXo
+      VIDEO_URL: https://www.youtube.com/watch?v=woSiT_kytXo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -U yt-dlp pillow curl-cffi youtube-transcript-api
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg jq
+          yt-dlp --version
+
+      - name: Prepare
+        run: |
+          mkdir -p capture/{text,video,audio,periodic,scenes,contact_sheets,manifests}
+
+      - name: Fetch transcript by independent routes
+        shell: bash
+        run: |
+          set +e
+          echo "=== youtube-transcript.ai default ==="
+          curl -v -L --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 240 \
+            "https://youtube-transcript.ai/transcript/${VIDEO_ID}.txt" \
+            -o capture/text/transcript_youtube-transcript-ai_default.md 2> capture/manifests/transcript_api_default_curl.log
+          echo "curl rc=$?"
+          echo "=== youtube-transcript.ai ko ==="
+          curl -v -L --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 240 \
+            "https://youtube-transcript.ai/transcript/${VIDEO_ID}.txt?lang=ko" \
+            -o capture/text/transcript_youtube-transcript-ai_ko.md 2> capture/manifests/transcript_api_ko_curl.log
+          echo "curl rc=$?"
+          echo "=== youtube-transcript-api python ==="
+          python - <<'PY' > capture/text/transcript_youtube_transcript_api.json 2> capture/manifests/youtube_transcript_api_python.log
+          import json
+          from youtube_transcript_api import YouTubeTranscriptApi
+          api=YouTubeTranscriptApi()
+          try:
+              t=api.fetch('woSiT_kytXo', languages=['ko','en'])
+              out={'video_id':'woSiT_kytXo','language':getattr(t,'language',None),'language_code':getattr(t,'language_code',None),'is_generated':getattr(t,'is_generated',None),'segments':[{'text':x.text,'start':x.start,'duration':x.duration} for x in t]}
+              print(json.dumps(out,ensure_ascii=False,indent=2))
+          except Exception as e:
+              print(json.dumps({'video_id':'woSiT_kytXo','error':repr(e)},ensure_ascii=False,indent=2))
+          PY
+          ls -lah capture/text capture/manifests
+
+      - name: Fetch metadata subtitles thumbnail with yt-dlp
+        shell: bash
+        run: |
+          set +e
+          cd capture/text
+          yt-dlp --verbose --no-playlist \
+            --impersonate chrome \
+            --write-info-json --write-description --write-thumbnail \
+            --write-subs --write-auto-subs --sub-langs "ko.*,en.*" --convert-subs vtt \
+            --skip-download -o "source.%(ext)s" "$VIDEO_URL" \
+            > ../manifests/ytdlp_metadata_stdout.log 2> ../manifests/ytdlp_metadata_stderr.log
+          echo $? > ../manifests/ytdlp_metadata_exit.txt
+          cd ../..
+          ls -lah capture/text capture/manifests
+
+      - name: Upload transcript and metadata early
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-text-metadata-early
+          path: |
+            capture/text
+            capture/manifests
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 6
+
+      - name: Download video through yt-dlp strategies
+        shell: bash
+        run: |
+          set +e
+          cd capture/video
+          strategies=(
+            "--impersonate chrome -f bv*[height<=720]+ba/b[height<=720]"
+            "--impersonate chrome --extractor-args youtube:player_client=web_safari,web_embedded -f bv*[height<=720]+ba/b[height<=720]"
+            "--impersonate chrome --extractor-args youtube:player_client=android_vr -f bv*[height<=720]+ba/b[height<=720]"
+            "--impersonate chrome -f b[height<=720]/best[height<=720]/best"
+          )
+          : > ../manifests/ytdlp_video_attempts.log
+          ok=0
+          for i in "${!strategies[@]}"; do
+            echo "=== attempt $((i+1)): ${strategies[$i]} ===" | tee -a ../manifests/ytdlp_video_attempts.log
+            rm -f source.*
+            eval yt-dlp --verbose --no-playlist --retries 10 --fragment-retries 10 --merge-output-format mp4 -o 'source.%(ext)s' ${strategies[$i]} '"$VIDEO_URL"' \
+              >> ../manifests/ytdlp_video_attempts.log 2>&1
+            rc=$?
+            echo "exit=$rc" | tee -a ../manifests/ytdlp_video_attempts.log
+            f=$(find . -maxdepth 1 -type f -name 'source.*' | head -n1)
+            if [ $rc -eq 0 ] && [ -n "$f" ] && [ -s "$f" ]; then ok=1; break; fi
+          done
+          if [ $ok -eq 1 ]; then
+            f=$(find . -maxdepth 1 -type f -name 'source.*' | head -n1)
+            if [ "$f" != "./source.mp4" ]; then
+              ffmpeg -y -i "$f" -c copy source.mp4 >> ../manifests/ytdlp_video_attempts.log 2>&1 || \
+                ffmpeg -y -i "$f" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k source.mp4 >> ../manifests/ytdlp_video_attempts.log 2>&1
+            fi
+            test -s source.mp4 && echo OK > ../manifests/video_download_status.txt
+          else
+            echo FAILED > ../manifests/video_download_status.txt
+          fi
+          cd ../..
+          cat capture/manifests/video_download_status.txt
+          ls -lah capture/video
+
+      - name: Process video, every frame, audio, scenes, periodic frames
+        shell: bash
+        run: |
+          set +e
+          if [ ! -s capture/video/source.mp4 ]; then
+            echo 'No source video; skipping frame/audio extraction' | tee capture/manifests/process_video_status.txt
+            exit 0
+          fi
+          set -e
+          ffprobe -v error -show_format -show_streams -of json capture/video/source.mp4 > capture/manifests/ffprobe.json
+          sha256sum capture/video/source.mp4 > capture/manifests/source_video.sha256
+          ffmpeg -y -v error -i capture/video/source.mp4 -vn -ac 1 -ar 16000 -c:a flac capture/audio/source_audio_16k_mono.flac
+          ffmpeg -y -v error -i capture/video/source.mp4 -vn -ac 1 -ar 16000 -c:a libmp3lame -b:a 64k capture/audio/source_audio_16k_mono.mp3
+          sha256sum capture/audio/* > capture/manifests/source_audio.sha256
+          # Process every decoded frame and record a frame-level checksum/timestamp manifest.
+          ffmpeg -v error -i capture/video/source.mp4 -map 0:v:0 -f framemd5 capture/manifests/all_frames.framemd5
+          awk 'BEGIN{n=0} /^[0-9]/{n++} END{print n}' capture/manifests/all_frames.framemd5 > capture/manifests/full_frame_count.txt
+          # 1 frame/second for exhaustive temporal scan plus low-threshold scene-change frames for UI/slide changes.
+          ffmpeg -v error -i capture/video/source.mp4 -vf "fps=1,scale='min(1280,iw)':-2" -q:v 3 capture/periodic/frame_%06d.jpg
+          ffmpeg -hide_banner -i capture/video/source.mp4 -vf "select='gt(scene,0.020)',scale='min(1600,iw)':-2,showinfo" -fps_mode vfr -q:v 2 capture/scenes/scene_%06d.jpg 2> capture/manifests/scene_showinfo.log || true
+          find capture/periodic -type f | wc -l > capture/manifests/periodic_frame_count.txt
+          find capture/scenes -type f | wc -l > capture/manifests/scene_frame_count.txt
+          # Compact visual proxy retains full chronology at 2fps for local reinspection.
+          ffmpeg -y -v error -i capture/video/source.mp4 -vf "fps=2,scale='min(1280,iw)':-2" -an -c:v libx264 -preset veryfast -crf 29 -movflags +faststart capture/video/visual_proxy_2fps_720p.mp4
+          echo OK > capture/manifests/process_video_status.txt
+
+      - name: Build contact sheets and final manifest
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          python - <<'PY'
+          from pathlib import Path
+          import json, math, hashlib
+          from PIL import Image, ImageDraw
+          frames=sorted(Path('capture/periodic').glob('*.jpg'))
+          out=Path('capture/contact_sheets'); out.mkdir(parents=True,exist_ok=True)
+          cols,rows,cell_w,cell_h=5,4,320,180
+          per=cols*rows
+          idx=[]
+          for pg in range(math.ceil(len(frames)/per)):
+              batch=frames[pg*per:(pg+1)*per]
+              sheet=Image.new('RGB',(cols*cell_w,rows*(cell_h+22)),(245,245,245))
+              draw=ImageDraw.Draw(sheet)
+              for i,p in enumerate(batch):
+                  im=Image.open(p).convert('RGB'); im.thumbnail((cell_w,cell_h))
+                  x=(i%cols)*cell_w+(cell_w-im.width)//2
+                  y=(i//cols)*(cell_h+22)+(cell_h-im.height)//2
+                  sheet.paste(im,(x,y))
+                  sec=pg*per+i
+                  draw.text(((i%cols)*cell_w+3,(i//cols)*(cell_h+22)+cell_h+3),f'{sec//60:02d}:{sec%60:02d}',fill=(0,0,0))
+                  idx.append({'second':sec,'frame':p.name,'sheet':pg+1,'cell':i+1})
+              sheet.save(out/f'sheet_{pg+1:04d}.jpg',quality=88,optimize=True)
+          Path('capture/manifests/contact_sheet_index.json').write_text(json.dumps(idx,ensure_ascii=False,indent=2),encoding='utf-8')
+          manifest={'video_id':'woSiT_kytXo','source_url':'https://www.youtube.com/watch?v=woSiT_kytXo','periodic_frames':len(frames),'contact_sheets':math.ceil(len(frames)/per) if frames else 0}
+          for k,f in [('full_frame_count','capture/manifests/full_frame_count.txt'),('scene_frame_count','capture/manifests/scene_frame_count.txt')]:
+              try: manifest[k]=int(Path(f).read_text().strip())
+              except: manifest[k]=None
+          try:
+              probe=json.loads(Path('capture/manifests/ffprobe.json').read_text())
+              manifest['duration_seconds']=float(probe['format']['duration'])
+          except: manifest['duration_seconds']=None
+          Path('capture/manifests/capture_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Upload final text manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-text-metadata-final
+          path: |
+            capture/text
+            capture/manifests
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 6
+
+      - name: Upload audio
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-audio
+          path: capture/audio
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 6
+
+      - name: Upload source and proxy video
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-video
+          path: capture/video
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload scene frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-scene-frames
+          path: capture/scenes
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 6
+
+      - name: Upload contact sheets
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-contact-sheets
+          path: capture/contact_sheets
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 6
