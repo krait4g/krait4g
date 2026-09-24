@@ -1,0 +1,270 @@
+name: tmp-youtube-alt-capture-woSiT
+
+on:
+  push:
+    branches:
+      - 'tmp/youtube-analysis-woSiT-kytXo'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture-alt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VIDEO_ID: woSiT_kytXo
+      VIDEO_URL: https://www.youtube.com/watch?v=woSiT_kytXo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools and JS runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -U yt-dlp pillow curl-cffi requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg jq
+          curl -fsSL https://deno.land/install.sh | sh || true
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+          "$HOME/.deno/bin/deno" --version || true
+          yt-dlp --version
+
+      - name: Prepare
+        run: mkdir -p capture/{video,audio,periodic,scenes,contact_sheets,manifests,alt_api}
+
+      - name: Try direct yt-dlp with Deno and multiple clients
+        shell: bash
+        run: |
+          set +e
+          cd capture/video
+          : > ../manifests/ytdlp_direct_attempts.log
+          for client in web_safari web_embedded android_vr tv_embedded; do
+            echo "=== client=$client ===" | tee -a ../manifests/ytdlp_direct_attempts.log
+            rm -f direct.*
+            yt-dlp --verbose --no-playlist --js-runtimes deno:"$HOME/.deno/bin/deno" --impersonate chrome \
+              --extractor-args "youtube:player_client=$client" \
+              --retries 5 --fragment-retries 5 --merge-output-format mp4 \
+              -f "bv*[height<=720]+ba/b[height<=720]" \
+              -o 'direct.%(ext)s' "$VIDEO_URL" >> ../manifests/ytdlp_direct_attempts.log 2>&1
+            rc=$?
+            f=$(find . -maxdepth 1 -type f -name 'direct.*' | head -n1)
+            echo "exit=$rc file=$f" | tee -a ../manifests/ytdlp_direct_attempts.log
+            if [ $rc -eq 0 ] && [ -n "$f" ] && [ -s "$f" ]; then
+              if [ "$f" = "./direct.mp4" ]; then cp direct.mp4 source.mp4; else ffmpeg -y -i "$f" -c copy source.mp4 || ffmpeg -y -i "$f" -c:v libx264 -c:a aac source.mp4; fi
+              break
+            fi
+          done
+          cd ../..
+          ls -lah capture/video
+
+      - name: Query Piped and Invidious APIs and download media
+        shell: bash
+        run: |
+          set +e
+          python - <<'PY'
+          import json, os, pathlib, requests, subprocess, sys, time
+          vid='woSiT_kytXo'
+          root=pathlib.Path('capture')
+          video=root/'video'/'source.mp4'
+          log=[]
+          headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36'}
+          sess=requests.Session(); sess.headers.update(headers)
+          def save_json(name,data):
+              (root/'alt_api'/name).write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+          def download(url,path,timeout=240):
+              path=pathlib.Path(path)
+              try:
+                  with sess.get(url,stream=True,timeout=(20,timeout),allow_redirects=True) as r:
+                      log.append(f'DOWNLOAD {url[:180]} status={r.status_code} len={r.headers.get("content-length")} type={r.headers.get("content-type")}')
+                      r.raise_for_status()
+                      with path.open('wb') as f:
+                          for chunk in r.iter_content(1024*1024):
+                              if chunk: f.write(chunk)
+                  return path.stat().st_size>100000
+              except Exception as e:
+                  log.append(f'DOWNLOAD_FAIL {url[:180]} {e!r}')
+                  try: path.unlink()
+                  except: pass
+                  return False
+          def merge(v,a,out):
+              p=subprocess.run(['ffmpeg','-y','-v','error','-i',str(v),'-i',str(a),'-c','copy',str(out)],capture_output=True,text=True)
+              log.append(f'MERGE rc={p.returncode} stderr={p.stderr[-1000:]}')
+              if p.returncode!=0:
+                  p=subprocess.run(['ffmpeg','-y','-v','error','-i',str(v),'-i',str(a),'-c:v','libx264','-preset','veryfast','-crf','22','-c:a','aac','-b:a','128k',str(out)],capture_output=True,text=True)
+                  log.append(f'MERGE_REENC rc={p.returncode} stderr={p.stderr[-1000:]}')
+              return pathlib.Path(out).exists() and pathlib.Path(out).stat().st_size>100000
+          if video.exists() and video.stat().st_size>100000:
+              log.append('direct yt-dlp succeeded; alt APIs skipped')
+          else:
+              piped=['https://pipedapi.kavin.rocks','https://pipedapi.leptons.xyz','https://pipedapi.nosebs.ru','https://pipedapi.adminforge.de']
+              for base in piped:
+                  if video.exists() and video.stat().st_size>100000: break
+                  try:
+                      u=f'{base}/streams/{vid}'
+                      r=sess.get(u,timeout=35)
+                      log.append(f'PIPED {u} status={r.status_code} bytes={len(r.content)}')
+                      if r.status_code!=200: continue
+                      data=r.json(); save_json('piped_'+base.split('//')[1].replace('.','_')+'.json',data)
+                      # Prefer progressive video with audio.
+                      vs=data.get('videoStreams') or []
+                      progressive=[x for x in vs if not x.get('videoOnly') and x.get('url')]
+                      def height(x):
+                          q=str(x.get('quality') or x.get('resolution') or '')
+                          import re
+                          m=re.search(r'(\d{3,4})',q); return int(m.group(1)) if m else 0
+                      progressive=[x for x in progressive if height(x)<=720 or height(x)==0]
+                      progressive.sort(key=lambda x:(height(x),x.get('bitrate') or 0),reverse=True)
+                      if progressive:
+                          if download(progressive[0]['url'],root/'video'/'piped_progressive.bin'):
+                              inp=root/'video'/'piped_progressive.bin'
+                              p=subprocess.run(['ffmpeg','-y','-v','error','-i',str(inp),'-c','copy',str(video)],capture_output=True,text=True)
+                              log.append('PIPED_PROGRESSIVE ffmpeg rc='+str(p.returncode)+' '+p.stderr[-800:])
+                              if video.exists() and video.stat().st_size>100000: break
+                      # Otherwise video-only + audio.
+                      video_only=[x for x in vs if x.get('videoOnly') and x.get('url')]
+                      video_only=[x for x in video_only if height(x)<=720 or height(x)==0]
+                      video_only.sort(key=lambda x:(height(x),x.get('bitrate') or 0),reverse=True)
+                      aud=[x for x in (data.get('audioStreams') or []) if x.get('url')]
+                      aud.sort(key=lambda x:x.get('bitrate') or 0,reverse=True)
+                      if video_only and aud:
+                          vp=root/'video'/'piped_video.bin'; ap=root/'video'/'piped_audio.bin'
+                          if download(video_only[0]['url'],vp) and download(aud[0]['url'],ap):
+                              if merge(vp,ap,video): break
+                      hls=data.get('hls')
+                      if hls and not (video.exists() and video.stat().st_size>100000):
+                          p=subprocess.run(['ffmpeg','-y','-v','error','-headers','User-Agent: '+headers['User-Agent']+'\r\n','-i',hls,'-c','copy',str(video)],capture_output=True,text=True,timeout=600)
+                          log.append('PIPED_HLS rc='+str(p.returncode)+' '+p.stderr[-800:])
+                  except Exception as e:
+                      log.append(f'PIPED_FAIL {base} {e!r}')
+              invs=['https://inv.nadeko.net','https://invidious.nerdvpn.de','https://yt.chocolatemoo53.com','https://invidious.tiekoetter.com','https://iv.ggtyler.dev','https://invidious.jing.rocks']
+              for base in invs:
+                  if video.exists() and video.stat().st_size>100000: break
+                  try:
+                      u=f'{base}/api/v1/videos/{vid}?local=true'
+                      r=sess.get(u,timeout=35)
+                      log.append(f'INVIDIOUS {u} status={r.status_code} bytes={len(r.content)}')
+                      if r.status_code!=200: continue
+                      data=r.json(); save_json('invidious_'+base.split('//')[1].replace('.','_')+'.json',data)
+                      fs=[x for x in (data.get('formatStreams') or []) if x.get('url')]
+                      def qh(x):
+                          import re
+                          m=re.search(r'(\d{3,4})',str(x.get('qualityLabel') or x.get('quality') or '')); return int(m.group(1)) if m else 0
+                      fs=[x for x in fs if qh(x)<=720 or qh(x)==0]; fs.sort(key=lambda x:qh(x),reverse=True)
+                      if fs and download(fs[0]['url'],root/'video'/'inv_progressive.bin'):
+                          inp=root/'video'/'inv_progressive.bin'
+                          p=subprocess.run(['ffmpeg','-y','-v','error','-i',str(inp),'-c','copy',str(video)],capture_output=True,text=True)
+                          log.append('INV_PROGRESSIVE rc='+str(p.returncode)+' '+p.stderr[-800:])
+                          if video.exists() and video.stat().st_size>100000: break
+                      adap=[x for x in (data.get('adaptiveFormats') or []) if x.get('url')]
+                      vids=[x for x in adap if str(x.get('type','')).startswith('video/') and (qh(x)<=720 or qh(x)==0)]
+                      auds=[x for x in adap if str(x.get('type','')).startswith('audio/')]
+                      vids.sort(key=lambda x:(qh(x),int(x.get('bitrate') or 0)),reverse=True); auds.sort(key=lambda x:int(x.get('bitrate') or 0),reverse=True)
+                      if vids and auds:
+                          vp=root/'video'/'inv_video.bin'; ap=root/'video'/'inv_audio.bin'
+                          if download(vids[0]['url'],vp) and download(auds[0]['url'],ap):
+                              if merge(vp,ap,video): break
+                      hls=data.get('hlsUrl')
+                      if hls and not (video.exists() and video.stat().st_size>100000):
+                          p=subprocess.run(['ffmpeg','-y','-v','error','-i',hls,'-c','copy',str(video)],capture_output=True,text=True,timeout=600)
+                          log.append('INV_HLS rc='+str(p.returncode)+' '+p.stderr[-800:])
+                  except Exception as e:
+                      log.append(f'INVIDIOUS_FAIL {base} {e!r}')
+          (root/'manifests'/'alternate_retrieval.log').write_text('\n'.join(log),encoding='utf-8')
+          print('\n'.join(log))
+          if video.exists(): print('FINAL_VIDEO',video,video.stat().st_size)
+          PY
+          ls -lah capture/video capture/alt_api capture/manifests
+
+      - name: Process video and every frame if recovered
+        shell: bash
+        run: |
+          set +e
+          if [ ! -s capture/video/source.mp4 ]; then echo FAILED > capture/manifests/video_recovered.txt; exit 0; fi
+          set -e
+          echo OK > capture/manifests/video_recovered.txt
+          ffprobe -v error -show_format -show_streams -of json capture/video/source.mp4 > capture/manifests/ffprobe.json
+          sha256sum capture/video/source.mp4 > capture/manifests/source_video.sha256
+          ffmpeg -y -v error -i capture/video/source.mp4 -vn -ac 1 -ar 16000 -c:a flac capture/audio/source_audio_16k_mono.flac
+          ffmpeg -y -v error -i capture/video/source.mp4 -vn -ac 1 -ar 16000 -c:a libmp3lame -b:a 64k capture/audio/source_audio_16k_mono.mp3
+          sha256sum capture/audio/* > capture/manifests/source_audio.sha256
+          ffmpeg -v error -i capture/video/source.mp4 -map 0:v:0 -f framemd5 capture/manifests/all_frames.framemd5
+          awk 'BEGIN{n=0} /^[0-9]/{n++} END{print n}' capture/manifests/all_frames.framemd5 > capture/manifests/full_frame_count.txt
+          ffmpeg -v error -i capture/video/source.mp4 -vf "fps=1,scale='min(1280,iw)':-2" -q:v 3 capture/periodic/frame_%06d.jpg
+          ffmpeg -hide_banner -i capture/video/source.mp4 -vf "select='gt(scene,0.020)',scale='min(1600,iw)':-2,showinfo" -fps_mode vfr -q:v 2 capture/scenes/scene_%06d.jpg 2> capture/manifests/scene_showinfo.log || true
+          find capture/periodic -type f | wc -l > capture/manifests/periodic_frame_count.txt
+          find capture/scenes -type f | wc -l > capture/manifests/scene_frame_count.txt
+          ffmpeg -y -v error -i capture/video/source.mp4 -vf "fps=2,scale='min(1280,iw)':-2" -an -c:v libx264 -preset veryfast -crf 29 -movflags +faststart capture/video/visual_proxy_2fps_720p.mp4
+
+      - name: Build contact sheets and manifest
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from PIL import Image,ImageDraw
+          import json,math
+          frames=sorted(Path('capture/periodic').glob('*.jpg')); out=Path('capture/contact_sheets');out.mkdir(parents=True,exist_ok=True)
+          cols,rows,cw,ch=5,4,320,180; per=cols*rows; idx=[]
+          for pg in range(math.ceil(len(frames)/per)):
+              batch=frames[pg*per:(pg+1)*per]; sh=Image.new('RGB',(cols*cw,rows*(ch+22)),(245,245,245));d=ImageDraw.Draw(sh)
+              for i,p in enumerate(batch):
+                  im=Image.open(p).convert('RGB');im.thumbnail((cw,ch));x=(i%cols)*cw+(cw-im.width)//2;y=(i//cols)*(ch+22)+(ch-im.height)//2;sh.paste(im,(x,y));sec=pg*per+i;d.text(((i%cols)*cw+3,(i//cols)*(ch+22)+ch+3),f'{sec//60:02d}:{sec%60:02d}',fill=(0,0,0));idx.append({'second':sec,'frame':p.name,'sheet':pg+1,'cell':i+1})
+              sh.save(out/f'sheet_{pg+1:04d}.jpg',quality=88,optimize=True)
+          Path('capture/manifests/contact_sheet_index.json').write_text(json.dumps(idx,ensure_ascii=False,indent=2),encoding='utf-8')
+          m={'video_id':'woSiT_kytXo','periodic_frames':len(frames),'contact_sheets':math.ceil(len(frames)/per) if frames else 0}
+          for k,f in [('full_frame_count','capture/manifests/full_frame_count.txt'),('scene_frame_count','capture/manifests/scene_frame_count.txt')]:
+              try:m[k]=int(Path(f).read_text().strip())
+              except:m[k]=None
+          try:
+              p=json.loads(Path('capture/manifests/ffprobe.json').read_text());m['duration_seconds']=float(p['format']['duration'])
+          except:m['duration_seconds']=None
+          Path('capture/manifests/capture_manifest.json').write_text(json.dumps(m,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(m)
+          PY
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-alt-diagnostics
+          path: |
+            capture/manifests
+            capture/alt_api
+          retention-days: 2
+
+      - name: Upload video
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-alt-video
+          path: capture/video
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload audio
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-alt-audio
+          path: capture/audio
+          if-no-files-found: warn
+          retention-days: 2
+
+      - name: Upload scenes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-alt-scenes
+          path: capture/scenes
+          if-no-files-found: warn
+          retention-days: 2
+
+      - name: Upload contact sheets
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-alt-contact-sheets
+          path: capture/contact_sheets
+          if-no-files-found: warn
+          retention-days: 2
